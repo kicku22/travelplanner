@@ -1,4 +1,6 @@
 import json
+import os
+import re
 import uuid
 from datetime import datetime, date, time, timedelta
 
@@ -18,6 +20,9 @@ CATEGORY_COLORS = {
     "🚗 Transport": "#a3a3a3",
     "🏨 Lodging": "#ff7cd1",
 }
+
+STORAGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_trips")
+os.makedirs(STORAGE_DIR, exist_ok=True)
 
 # --- Session State Initialization ---
 if "trip" not in st.session_state:
@@ -203,10 +208,179 @@ def export_markdown():
     return "\n".join(lines)
 
 
-# --- Sidebar: Trip Settings & Data Management ---
+def slugify(text):
+    slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    return slug or "trip"
+
+
+def saved_trip_path(name):
+    return os.path.join(STORAGE_DIR, f"{slugify(name)}.json")
+
+
+def list_saved_trips():
+    trips = []
+    for fname in os.listdir(STORAGE_DIR):
+        if not fname.endswith(".json"):
+            continue
+        path = os.path.join(STORAGE_DIR, fname)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        trips.append({
+            "name": data.get("trip", {}).get("name") or fname[:-5],
+            "path": path,
+            "modified": datetime.fromtimestamp(os.path.getmtime(path)),
+        })
+    trips.sort(key=lambda t: t["modified"], reverse=True)
+    return trips
+
+
+def save_trip_to_disk(name):
+    with open(saved_trip_path(name), "w", encoding="utf-8") as f:
+        f.write(export_state())
+
+
+def load_trip_from_disk(path):
+    with open(path, "r", encoding="utf-8") as f:
+        import_state(f.read())
+
+
+def delete_trip_from_disk(path):
+    if os.path.exists(path):
+        os.remove(path)
+
+
+def reset_trip():
+    st.session_state.trip = {
+        "name": "New Trip",
+        "destination": "",
+        "start_date": date.today(),
+        "num_days": 5,
+        "currency": "$",
+        "budget": 0.0,
+    }
+    st.session_state.bucket_list = []
+    st.session_state.itinerary = []
+    st.session_state.packing_list = []
+    st.session_state.last_deleted = None
+
+
+CUSTOM_CSS = """
+<style>
+.stApp {
+    background: linear-gradient(180deg, #eef6ff 0%, #ffffff 420px);
+}
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #f7f9fc 0%, #eef2f7 100%);
+}
+.tp-hero {
+    background: linear-gradient(120deg, #0f2027 0%, #203a43 45%, #2c5364 100%);
+    border-radius: 18px;
+    padding: 2rem 2.25rem;
+    color: #f5f7fa;
+    margin-bottom: 1.5rem;
+    box-shadow: 0 10px 30px rgba(15, 32, 39, 0.25);
+    position: relative;
+    overflow: hidden;
+}
+.tp-hero::after {
+    content: "";
+    position: absolute;
+    right: -60px;
+    top: -60px;
+    width: 220px;
+    height: 220px;
+    background: radial-gradient(circle, rgba(255,255,255,0.14), transparent 70%);
+}
+.tp-hero h1 {
+    margin: 0;
+    font-size: 2.1rem;
+    font-weight: 700;
+}
+.tp-hero .tp-destination {
+    font-size: 1.05rem;
+    opacity: 0.92;
+    margin-top: 0.35rem;
+}
+.tp-hero-badge {
+    display: inline-block;
+    margin-top: 0.9rem;
+    padding: 0.35rem 0.9rem;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.16);
+    font-size: 0.85rem;
+    font-weight: 600;
+}
+.stTabs [data-baseweb="tab-list"] {
+    gap: 4px;
+}
+.stTabs [data-baseweb="tab"] {
+    border-radius: 999px 999px 0 0;
+    padding: 8px 18px;
+    font-weight: 600;
+}
+div[data-testid="stVerticalBlockBorderWrapper"] > div {
+    border-radius: 14px;
+}
+.tp-item-card {
+    padding: 14px 16px;
+    border-radius: 12px;
+    margin-bottom: 10px;
+    background: #ffffff;
+    border: 1px solid #e7ebf0;
+    border-left: 6px solid var(--card-color, #ff6b6b);
+    box-shadow: 0 2px 10px rgba(15, 32, 39, 0.06);
+}
+.tp-sidebar-brand {
+    font-size: 1.3rem;
+    font-weight: 700;
+    margin-bottom: 0.75rem;
+}
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+# --- Sidebar: Trip Library & Settings ---
 with st.sidebar:
-    st.header("🧭 Trip Settings")
     trip = st.session_state.trip
+
+    st.markdown('<div class="tp-sidebar-brand">🌍 My Trips</div>', unsafe_allow_html=True)
+    saved_trips = list_saved_trips()
+    if saved_trips:
+        trip_options = {
+            f"{t['name']} · saved {t['modified'].strftime('%b %d, %H:%M')}": t for t in saved_trips
+        }
+        selected_label = st.selectbox("Saved trips", list(trip_options.keys()), label_visibility="collapsed")
+        selected_trip = trip_options[selected_label]
+        lc1, lc2, lc3 = st.columns(3)
+        if lc1.button("📂 Load", width='stretch'):
+            load_trip_from_disk(selected_trip["path"])
+            st.toast(f"Loaded “{selected_trip['name']}”", icon="📂")
+            st.rerun()
+        if lc2.button("🆕 New", width='stretch'):
+            reset_trip()
+            st.toast("Started a new trip", icon="🆕")
+            st.rerun()
+        if lc3.button("🗑️ Delete", width='stretch'):
+            delete_trip_from_disk(selected_trip["path"])
+            st.toast(f"Deleted “{selected_trip['name']}”", icon="🗑️")
+            st.rerun()
+    else:
+        st.caption("No saved trips yet — plan below, then save your progress.")
+        if st.button("🆕 New Trip", width='stretch'):
+            reset_trip()
+            st.toast("Started a new trip", icon="🆕")
+            st.rerun()
+
+    if st.button("💾 Save Current Trip", width='stretch', type="primary"):
+        save_trip_to_disk(trip["name"] or "My Trip")
+        st.toast(f"Saved “{trip['name'] or 'My Trip'}” — reload it any time", icon="💾")
+        st.rerun()
+
+    st.divider()
+    st.header("🧭 Trip Settings")
     trip["name"] = st.text_input("Trip Name", value=trip["name"])
     trip["destination"] = st.text_input("Destination", value=trip["destination"])
     trip["start_date"] = st.date_input("Start Date", value=trip["start_date"])
@@ -223,14 +397,14 @@ with st.sidebar:
         st.caption(f"Trip started {-days_until} days ago.")
 
     st.divider()
-    st.header("💾 Save / Load")
+    st.header("📤 Backup / Transfer")
     st.download_button(
         "Export Trip (JSON)", data=export_state(), file_name=f"{trip['name'] or 'trip'}.json", mime="application/json"
     )
     uploaded = st.file_uploader("Import Trip (JSON)", type="json")
     if uploaded is not None and st.button("Load Imported Trip"):
         import_state(uploaded.getvalue().decode("utf-8"))
-        st.success("Trip loaded!")
+        st.toast("Trip imported!", icon="📂")
         st.rerun()
 
     if st.session_state.last_deleted is not None:
@@ -240,8 +414,24 @@ with st.sidebar:
             st.rerun()
 
 
-st.title("✈️ Dynamic Travel Itinerary Builder")
-st.markdown(f"**{trip['name']}** — {trip['destination'] or 'Destination TBD'}")
+days_until = (trip["start_date"] - date.today()).days
+if days_until > 0:
+    hero_badge = f"🗓️ {days_until} days to go"
+elif days_until == 0:
+    hero_badge = "✈️ Departing today!"
+else:
+    hero_badge = f"🏁 Trip started {-days_until} days ago"
+
+st.markdown(
+    f"""
+    <div class="tp-hero">
+        <h1>✈️ {trip['name'] or 'Untitled Trip'}</h1>
+        <div class="tp-destination">📍 {trip['destination'] or 'Destination TBD'}</div>
+        <span class="tp-hero-badge">{hero_badge}</span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 tab_plan, tab_itinerary, tab_budget, tab_packing, tab_stats = st.tabs(
     ["📋 Plan", "🗺️ Itinerary", "💰 Budget", "🎒 Packing List", "📊 Stats"]
@@ -365,12 +555,7 @@ with tab_itinerary:
                     cost_str = f" · {trip['currency']}{item['Cost']:.2f}" if item.get("Cost") else ""
                     st.markdown(
                         f"""
-                        <div style="
-                            padding: 10px;
-                            border-radius: 5px;
-                            margin-bottom: 6px;
-                            background-color: #f0f2f6;
-                            border-left: 5px solid {color};">
+                        <div class="tp-item-card" style="--card-color: {color};">
                             <strong>{time_str}</strong> | {item['Category']} | {item['Priority']}{cost_str}
                             <h4 style="margin:0; padding-top:5px;">{item['Place']}</h4>
                             <em style="color: #555;">{item.get('Notes') or ''}</em>
@@ -474,7 +659,7 @@ with tab_budget:
             ]
         )
         if not cost_df.empty:
-            st.dataframe(cost_df, hide_index=True, use_container_width=True)
+            st.dataframe(cost_df, hide_index=True, width='stretch')
     else:
         st.write("Add places with costs to see your budget breakdown.")
 
