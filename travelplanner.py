@@ -1,32 +1,30 @@
 import json
-import os
-import re
 import uuid
 from datetime import datetime, date, time, timedelta
 
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="Travel Itinerary Builder", page_icon="✈️", layout="wide")
+st.set_page_config(page_title="Voyager · Trip Planner", page_icon="🧭", layout="wide")
 
-CATEGORIES = ["📸 Sightseeing", "🍜 Food", "☕ R&R", "🛍️ Shopping", "🚶 Exploration", "🚗 Transport", "🏨 Lodging"]
+import db
+import geocode
+import mapview
+import theme
+from theme import CATEGORY_COLORS, day_color
+
+CATEGORIES = list(CATEGORY_COLORS.keys())
 PRIORITIES = ["🔥 Must Do", "👍 Would Like", "🤷 Optional"]
-CATEGORY_COLORS = {
-    "📸 Sightseeing": "#ff4b4b",
-    "🍜 Food": "#ffa421",
-    "☕ R&R": "#7defa1",
-    "🛍️ Shopping": "#8e7cff",
-    "🚶 Exploration": "#4bb3ff",
-    "🚗 Transport": "#a3a3a3",
-    "🏨 Lodging": "#ff7cd1",
-}
 
-STORAGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "saved_trips")
-os.makedirs(STORAGE_DIR, exist_ok=True)
+db.init_db()
+theme.inject()
 
-# --- Session State Initialization ---
-if "trip" not in st.session_state:
-    st.session_state.trip = {
+
+# ==================================================================
+# STATE
+# ==================================================================
+def blank_trip():
+    return {
         "name": "My Trip",
         "destination": "",
         "start_date": date.today(),
@@ -35,703 +33,947 @@ if "trip" not in st.session_state:
         "budget": 0.0,
     }
 
-if "bucket_list" not in st.session_state:
+
+def reset_workspace(trip=None):
+    st.session_state.trip = trip or blank_trip()
     st.session_state.bucket_list = []
-
-if "itinerary" not in st.session_state:
     st.session_state.itinerary = []
-
-if "packing_list" not in st.session_state:
     st.session_state.packing_list = []
-
-if "last_deleted" not in st.session_state:
     st.session_state.last_deleted = None
+    st.session_state.current_trip_id = None
+    st.session_state.dirty = False
 
 
-# --- Helper Functions ---
+for key, default in (("user", None), ("current_trip_id", None),
+                     ("last_deleted", None), ("pending_coords", None),
+                     ("geocode_results", None), ("dirty", False)):
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+if "trip" not in st.session_state:
+    reset_workspace()
+
+
 def new_id():
     return uuid.uuid4().hex[:8]
 
 
-def day_label(day_index):
+def mark_dirty():
+    st.session_state.dirty = True
+
+
+# ==================================================================
+# SERIALIZATION
+# ==================================================================
+def serialize_state():
     trip = st.session_state.trip
-    d = trip["start_date"] + timedelta(days=day_index)
-    return f"Day {day_index + 1} · {d.strftime('%a, %b %d')}"
+    return {
+        "trip": {**trip, "start_date": trip["start_date"].isoformat()},
+        "bucket_list": st.session_state.bucket_list,
+        "itinerary": [
+            {**item, "Time": item["Time"].strftime("%H:%M")}
+            for item in st.session_state.itinerary
+        ],
+        "packing_list": st.session_state.packing_list,
+    }
 
 
+def apply_state(data):
+    trip = dict(data.get("trip") or {})
+    base = blank_trip()
+    base.update({k: v for k, v in trip.items() if k in base})
+    base["start_date"] = date.fromisoformat(trip["start_date"]) if trip.get("start_date") \
+        else date.today()
+    base["num_days"] = int(base["num_days"] or 1)
+    base["budget"] = float(base["budget"] or 0)
+
+    itinerary = [dict(i) for i in data.get("itinerary", [])]
+    for item in itinerary:
+        item["Time"] = datetime.strptime(item["Time"], "%H:%M").time()
+    itinerary.sort(key=lambda x: (x["Day"], x["Time"]))
+
+    st.session_state.trip = base
+    st.session_state.bucket_list = [dict(i) for i in data.get("bucket_list", [])]
+    st.session_state.itinerary = itinerary
+    st.session_state.packing_list = [dict(i) for i in data.get("packing_list", [])]
+    st.session_state.last_deleted = None
+    st.session_state.dirty = False
+
+
+# ==================================================================
+# AUTH SCREEN
+# ==================================================================
+def render_auth():
+    st.markdown(
+        """
+        <div class="tp-authwrap">
+            <span class="tp-logo">🧭</span>
+            <h1>Voyager</h1>
+            <p>Design your trip day by day — bucket list, budget, satellite map
+            and packing, all in one place.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    left, middle, right = st.columns([1, 1.25, 1])
+    with middle:
+        login_tab, signup_tab = st.tabs(["🔓 Log in", "✨ Create account"])
+
+        with login_tab:
+            with st.form("login_form"):
+                username = st.text_input("Username", key="login_user")
+                password = st.text_input("Password", type="password", key="login_pw")
+                if st.form_submit_button("Log in", type="primary", width="stretch"):
+                    try:
+                        user = db.verify_user(username, password)
+                    except db.AuthError as exc:
+                        st.error(str(exc))
+                    else:
+                        st.session_state.user = user
+                        recent = db.list_trips(user["id"])
+                        if recent:
+                            loaded = db.load_trip(user["id"], recent[0]["id"])
+                            apply_state(loaded["state"])
+                            st.session_state.current_trip_id = loaded["id"]
+                        else:
+                            reset_workspace()
+                        st.rerun()
+
+        with signup_tab:
+            with st.form("signup_form"):
+                new_user = st.text_input("Username", help="3-32 chars: letters, numbers, . _ -")
+                display = st.text_input("Display name (optional)")
+                pw1 = st.text_input("Password", type="password",
+                                    help=f"At least {db.MIN_PASSWORD_LENGTH} characters")
+                pw2 = st.text_input("Confirm password", type="password")
+                if st.form_submit_button("Create account", type="primary", width="stretch"):
+                    if pw1 != pw2:
+                        st.error("Those passwords don't match.")
+                    else:
+                        try:
+                            user = db.create_user(new_user, pw1, display or new_user)
+                        except db.AuthError as exc:
+                            st.error(str(exc))
+                        else:
+                            st.session_state.user = user
+                            reset_workspace()
+                            st.rerun()
+
+        st.markdown(
+            """
+            <div style="margin-top:1.4rem">
+                <div class="tp-feature">🗓️ <span>Drag ideas from a bucket list onto real
+                days and times, with overlap warnings.</span></div>
+                <div class="tp-feature">🛰️ <span>See every stop on a satellite map with
+                per-day routes.</span></div>
+                <div class="tp-feature">🔐 <span>Your trips are saved to your own account —
+                reopen and edit them any time.</span></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+if st.session_state.user is None:
+    render_auth()
+    st.stop()
+
+user = st.session_state.user
+
+
+# ==================================================================
+# HELPERS
+# ==================================================================
 def day_options():
-    return list(range(st.session_state.trip["num_days"]))
+    return list(range(int(st.session_state.trip["num_days"])))
 
 
-def add_to_bucket_list(place, category, notes, priority, cost, duration, lat, lon):
-    st.session_state.bucket_list.append({
-        "id": new_id(),
-        "Place": place,
-        "Category": category,
-        "Notes": notes,
-        "Priority": priority,
-        "Cost": cost,
-        "Duration": duration,
-        "Lat": lat,
-        "Lon": lon,
-    })
+def day_date(day_index):
+    return st.session_state.trip["start_date"] + timedelta(days=day_index)
+
+
+def day_label(day_index):
+    return f"Day {day_index + 1} · {day_date(day_index).strftime('%a, %b %d')}"
 
 
 def find_by_id(items, item_id):
-    for i, item in enumerate(items):
+    for index, item in enumerate(items):
         if item["id"] == item_id:
-            return i
+            return index
     return None
 
 
 def move_to_itinerary(item_id, day_index, time_val):
-    idx = find_by_id(st.session_state.bucket_list, item_id)
-    if idx is None:
+    index = find_by_id(st.session_state.bucket_list, item_id)
+    if index is None:
         return
-    item = st.session_state.bucket_list.pop(idx)
+    item = st.session_state.bucket_list.pop(index)
     item["Day"] = day_index
     item["Time"] = time_val
     st.session_state.itinerary.append(item)
     st.session_state.itinerary.sort(key=lambda x: (x["Day"], x["Time"]))
+    mark_dirty()
 
 
 def move_to_bucket_list(item_id):
-    idx = find_by_id(st.session_state.itinerary, item_id)
-    if idx is None:
+    index = find_by_id(st.session_state.itinerary, item_id)
+    if index is None:
         return
-    item = st.session_state.itinerary.pop(idx)
+    item = st.session_state.itinerary.pop(index)
     item.pop("Day", None)
     item.pop("Time", None)
     st.session_state.bucket_list.append(item)
+    mark_dirty()
 
 
-def delete_item(collection_name, item_id):
-    items = st.session_state[collection_name]
-    idx = find_by_id(items, item_id)
-    if idx is None:
+def delete_item(collection, item_id):
+    items = st.session_state[collection]
+    index = find_by_id(items, item_id)
+    if index is None:
         return
-    removed = items.pop(idx)
-    st.session_state.last_deleted = (collection_name, removed)
+    st.session_state.last_deleted = (collection, items.pop(index))
+    mark_dirty()
 
 
 def restore_last_deleted():
-    if st.session_state.last_deleted is None:
+    if not st.session_state.last_deleted:
         return
-    collection_name, item = st.session_state.last_deleted
-    st.session_state[collection_name].append(item)
-    if collection_name == "itinerary":
+    collection, item = st.session_state.last_deleted
+    st.session_state[collection].append(item)
+    if collection == "itinerary":
         st.session_state.itinerary.sort(key=lambda x: (x["Day"], x["Time"]))
     st.session_state.last_deleted = None
+    mark_dirty()
 
 
-def time_range_overlap(start_a, end_a, start_b, end_b):
-    return start_a < end_b and start_b < end_a
+def item_end(item):
+    start = datetime.combine(date.min, item["Time"])
+    return start + timedelta(minutes=item.get("Duration") or 60)
 
 
 def find_conflicts(day_index):
-    day_items = [i for i in st.session_state.itinerary if i["Day"] == day_index]
+    items = sorted(
+        [i for i in st.session_state.itinerary if i["Day"] == day_index],
+        key=lambda x: x["Time"],
+    )
     conflicts = []
-    for a in range(len(day_items)):
-        for b in range(a + 1, len(day_items)):
-            item_a, item_b = day_items[a], day_items[b]
-            start_a = datetime.combine(date.min, item_a["Time"])
-            end_a = start_a + timedelta(minutes=item_a.get("Duration") or 60)
-            start_b = datetime.combine(date.min, item_b["Time"])
-            end_b = start_b + timedelta(minutes=item_b.get("Duration") or 60)
-            if time_range_overlap(start_a, end_a, start_b, end_b):
-                conflicts.append((item_a["Place"], item_b["Place"]))
+    for a in range(len(items)):
+        for b in range(a + 1, len(items)):
+            first, second = items[a], items[b]
+            start_first = datetime.combine(date.min, first["Time"])
+            start_second = datetime.combine(date.min, second["Time"])
+            if start_first < item_end(second) and start_second < item_end(first):
+                conflicts.append((first["Place"], second["Place"]))
     return conflicts
 
 
-def export_state():
-    state = {
-        "trip": {**st.session_state.trip, "start_date": st.session_state.trip["start_date"].isoformat()},
-        "bucket_list": st.session_state.bucket_list,
-        "itinerary": [
-            {**item, "Time": item["Time"].strftime("%H:%M")} for item in st.session_state.itinerary
-        ],
-        "packing_list": st.session_state.packing_list,
-    }
-    return json.dumps(state, indent=2)
+def all_items():
+    return st.session_state.bucket_list + st.session_state.itinerary
 
 
-def import_state(raw):
-    data = json.loads(raw)
-    trip = data["trip"]
-    trip["start_date"] = date.fromisoformat(trip["start_date"])
-    st.session_state.trip = trip
-    st.session_state.bucket_list = data.get("bucket_list", [])
-    itinerary = data.get("itinerary", [])
-    for item in itinerary:
-        item["Time"] = datetime.strptime(item["Time"], "%H:%M").time()
-    st.session_state.itinerary = itinerary
-    st.session_state.packing_list = data.get("packing_list", [])
+def day_minutes(day_index):
+    return sum((i.get("Duration") or 0) for i in st.session_state.itinerary
+               if i["Day"] == day_index)
 
 
+def money(amount):
+    return f"{st.session_state.trip['currency']}{amount:,.2f}"
+
+
+def has_coords(item):
+    return item.get("Lat") not in (None, 0) and item.get("Lon") not in (None, 0)
+
+
+# ==================================================================
+# EXPORTS
+# ==================================================================
 def ics_escape(text):
-    return str(text).replace("\\", "\\\\").replace(",", "\\,").replace(";", "\\;").replace("\n", "\\n")
+    return (str(text).replace("\\", "\\\\").replace(",", "\\,")
+            .replace(";", "\\;").replace("\n", "\\n"))
 
 
 def export_ics():
-    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Travel Itinerary Builder//EN"]
-    trip = st.session_state.trip
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Voyager Trip Planner//EN"]
     for item in st.session_state.itinerary:
-        start_dt = datetime.combine(trip["start_date"] + timedelta(days=item["Day"]), item["Time"])
-        end_dt = start_dt + timedelta(minutes=item.get("Duration") or 60)
+        start = datetime.combine(day_date(item["Day"]), item["Time"])
+        end = start + timedelta(minutes=item.get("Duration") or 60)
         lines += [
             "BEGIN:VEVENT",
-            f"UID:{item['id']}@travel-itinerary-builder",
-            f"DTSTART:{start_dt.strftime('%Y%m%dT%H%M%S')}",
-            f"DTEND:{end_dt.strftime('%Y%m%dT%H%M%S')}",
+            f"UID:{item['id']}@voyager-trip-planner",
+            f"DTSTART:{start.strftime('%Y%m%dT%H%M%S')}",
+            f"DTEND:{end.strftime('%Y%m%dT%H%M%S')}",
             f"SUMMARY:{ics_escape(item['Category'])} {ics_escape(item['Place'])}",
             f"DESCRIPTION:{ics_escape(item.get('Notes') or '')}",
-            "END:VEVENT",
         ]
+        if has_coords(item):
+            lines.append(f"GEO:{item['Lat']};{item['Lon']}")
+        lines.append("END:VEVENT")
     lines.append("END:VCALENDAR")
     return "\n".join(lines)
 
 
 def export_markdown():
     trip = st.session_state.trip
-    lines = [f"# {trip['name']}", f"**Destination:** {trip['destination']}", ""]
-    for day_index in day_options():
-        day_items = [i for i in st.session_state.itinerary if i["Day"] == day_index]
-        if not day_items:
+    lines = [f"# {trip['name']}", "", f"**Destination:** {trip['destination']}",
+             f"**Dates:** {trip['start_date']:%b %d, %Y} · {trip['num_days']} days", ""]
+    for index in day_options():
+        items = sorted([i for i in st.session_state.itinerary if i["Day"] == index],
+                       key=lambda x: x["Time"])
+        if not items:
             continue
-        lines.append(f"## {day_label(day_index)}")
-        for item in sorted(day_items, key=lambda x: x["Time"]):
-            cost_str = f" — {trip['currency']}{item['Cost']:.2f}" if item.get("Cost") else ""
-            lines.append(f"- **{item['Time'].strftime('%I:%M %p')}** {item['Category']} {item['Place']}{cost_str}")
+        lines.append(f"## {day_label(index)}")
+        for item in items:
+            cost = f" — {money(item['Cost'])}" if item.get("Cost") else ""
+            lines.append(f"- **{item['Time']:%I:%M %p}** {item['Category']} "
+                         f"{item['Place']}{cost}")
             if item.get("Notes"):
                 lines.append(f"  - _{item['Notes']}_")
         lines.append("")
+    if st.session_state.bucket_list:
+        lines.append("## Not yet scheduled")
+        for item in st.session_state.bucket_list:
+            lines.append(f"- {item['Category']} {item['Place']}")
     return "\n".join(lines)
 
 
-def slugify(text):
-    slug = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
-    return slug or "trip"
+def itinerary_dataframe():
+    return pd.DataFrame([
+        {
+            "Day": day_label(i["Day"]),
+            "Date": day_date(i["Day"]).isoformat(),
+            "Time": i["Time"].strftime("%H:%M"),
+            "Place": i["Place"],
+            "Category": i["Category"],
+            "Priority": i["Priority"],
+            "Duration (min)": i.get("Duration") or 0,
+            "Cost": i.get("Cost") or 0,
+            "Latitude": i.get("Lat") or "",
+            "Longitude": i.get("Lon") or "",
+            "Notes": i.get("Notes") or "",
+        }
+        for i in st.session_state.itinerary
+    ])
 
 
-def saved_trip_path(name):
-    return os.path.join(STORAGE_DIR, f"{slugify(name)}.json")
-
-
-def list_saved_trips():
-    trips = []
-    for fname in os.listdir(STORAGE_DIR):
-        if not fname.endswith(".json"):
-            continue
-        path = os.path.join(STORAGE_DIR, fname)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            continue
-        trips.append({
-            "name": data.get("trip", {}).get("name") or fname[:-5],
-            "path": path,
-            "modified": datetime.fromtimestamp(os.path.getmtime(path)),
-        })
-    trips.sort(key=lambda t: t["modified"], reverse=True)
-    return trips
-
-
-def save_trip_to_disk(name):
-    with open(saved_trip_path(name), "w", encoding="utf-8") as f:
-        f.write(export_state())
-
-
-def load_trip_from_disk(path):
-    with open(path, "r", encoding="utf-8") as f:
-        import_state(f.read())
-
-
-def delete_trip_from_disk(path):
-    if os.path.exists(path):
-        os.remove(path)
-
-
-def reset_trip():
-    st.session_state.trip = {
-        "name": "New Trip",
-        "destination": "",
-        "start_date": date.today(),
-        "num_days": 5,
-        "currency": "$",
-        "budget": 0.0,
-    }
-    st.session_state.bucket_list = []
-    st.session_state.itinerary = []
-    st.session_state.packing_list = []
-    st.session_state.last_deleted = None
-
-
-CUSTOM_CSS = """
-<style>
-.stApp {
-    background: linear-gradient(180deg, #eef6ff 0%, #ffffff 420px);
-}
-[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #f7f9fc 0%, #eef2f7 100%);
-}
-.tp-hero {
-    background: linear-gradient(120deg, #0f2027 0%, #203a43 45%, #2c5364 100%);
-    border-radius: 18px;
-    padding: 2rem 2.25rem;
-    color: #f5f7fa;
-    margin-bottom: 1.5rem;
-    box-shadow: 0 10px 30px rgba(15, 32, 39, 0.25);
-    position: relative;
-    overflow: hidden;
-}
-.tp-hero::after {
-    content: "";
-    position: absolute;
-    right: -60px;
-    top: -60px;
-    width: 220px;
-    height: 220px;
-    background: radial-gradient(circle, rgba(255,255,255,0.14), transparent 70%);
-}
-.tp-hero h1 {
-    margin: 0;
-    font-size: 2.1rem;
-    font-weight: 700;
-}
-.tp-hero .tp-destination {
-    font-size: 1.05rem;
-    opacity: 0.92;
-    margin-top: 0.35rem;
-}
-.tp-hero-badge {
-    display: inline-block;
-    margin-top: 0.9rem;
-    padding: 0.35rem 0.9rem;
-    border-radius: 999px;
-    background: rgba(255,255,255,0.16);
-    font-size: 0.85rem;
-    font-weight: 600;
-}
-.stTabs [data-baseweb="tab-list"] {
-    gap: 4px;
-}
-.stTabs [data-baseweb="tab"] {
-    border-radius: 999px 999px 0 0;
-    padding: 8px 18px;
-    font-weight: 600;
-}
-div[data-testid="stVerticalBlockBorderWrapper"] > div {
-    border-radius: 14px;
-}
-.tp-item-card {
-    padding: 14px 16px;
-    border-radius: 12px;
-    margin-bottom: 10px;
-    background: #ffffff;
-    border: 1px solid #e7ebf0;
-    border-left: 6px solid var(--card-color, #ff6b6b);
-    box-shadow: 0 2px 10px rgba(15, 32, 39, 0.06);
-}
-.tp-sidebar-brand {
-    font-size: 1.3rem;
-    font-weight: 700;
-    margin-bottom: 0.75rem;
-}
-</style>
-"""
-st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
-
-# --- Sidebar: Trip Library & Settings ---
+# ==================================================================
+# SIDEBAR
+# ==================================================================
 with st.sidebar:
     trip = st.session_state.trip
 
-    st.markdown('<div class="tp-sidebar-brand">🌍 My Trips</div>', unsafe_allow_html=True)
-    saved_trips = list_saved_trips()
-    if saved_trips:
-        trip_options = {
-            f"{t['name']} · saved {t['modified'].strftime('%b %d, %H:%M')}": t for t in saved_trips
-        }
-        selected_label = st.selectbox("Saved trips", list(trip_options.keys()), label_visibility="collapsed")
-        selected_trip = trip_options[selected_label]
-        lc1, lc2, lc3 = st.columns(3)
-        if lc1.button("📂 Load", width='stretch'):
-            load_trip_from_disk(selected_trip["path"])
-            st.toast(f"Loaded “{selected_trip['name']}”", icon="📂")
-            st.rerun()
-        if lc2.button("🆕 New", width='stretch'):
-            reset_trip()
-            st.toast("Started a new trip", icon="🆕")
-            st.rerun()
-        if lc3.button("🗑️ Delete", width='stretch'):
-            delete_trip_from_disk(selected_trip["path"])
-            st.toast(f"Deleted “{selected_trip['name']}”", icon="🗑️")
-            st.rerun()
-    else:
-        st.caption("No saved trips yet — plan below, then save your progress.")
-        if st.button("🆕 New Trip", width='stretch'):
-            reset_trip()
-            st.toast("Started a new trip", icon="🆕")
-            st.rerun()
-
-    if st.button("💾 Save Current Trip", width='stretch', type="primary"):
-        save_trip_to_disk(trip["name"] or "My Trip")
-        st.toast(f"Saved “{trip['name'] or 'My Trip'}” — reload it any time", icon="💾")
-        st.rerun()
-
-    st.divider()
-    st.header("🧭 Trip Settings")
-    trip["name"] = st.text_input("Trip Name", value=trip["name"])
-    trip["destination"] = st.text_input("Destination", value=trip["destination"])
-    trip["start_date"] = st.date_input("Start Date", value=trip["start_date"])
-    trip["num_days"] = st.number_input("Number of Days", min_value=1, max_value=60, value=trip["num_days"])
-    trip["currency"] = st.text_input("Currency Symbol", value=trip["currency"], max_chars=3)
-    trip["budget"] = st.number_input("Total Budget", min_value=0.0, value=float(trip["budget"]), step=50.0)
-
-    days_until = (trip["start_date"] - date.today()).days
-    if days_until > 0:
-        st.info(f"🗓️ {days_until} days until departure!")
-    elif days_until == 0:
-        st.success("✈️ Trip starts today!")
-    else:
-        st.caption(f"Trip started {-days_until} days ago.")
-
-    st.divider()
-    st.header("📤 Backup / Transfer")
-    st.download_button(
-        "Export Trip (JSON)", data=export_state(), file_name=f"{trip['name'] or 'trip'}.json", mime="application/json"
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:.6rem;margin-bottom:1rem">'
+        f'<span class="tp-logo" style="width:40px;height:40px;font-size:1.2rem;'
+        f'border-radius:13px">🧭</span>'
+        f'<div><div style="font-family:Sora;font-weight:700">'
+        f'{theme.esc(user["display_name"])}</div>'
+        f'<div style="font-size:.74rem;color:var(--muted)">@{theme.esc(user["username"])}'
+        f'</div></div></div>',
+        unsafe_allow_html=True,
     )
-    uploaded = st.file_uploader("Import Trip (JSON)", type="json")
-    if uploaded is not None and st.button("Load Imported Trip"):
-        import_state(uploaded.getvalue().decode("utf-8"))
-        st.toast("Trip imported!", icon="📂")
+    if st.button("Log out", width="stretch"):
+        st.session_state.user = None
+        reset_workspace()
         st.rerun()
 
-    if st.session_state.last_deleted is not None:
+    st.divider()
+
+    saved = db.list_trips(user["id"])
+    status = "● Unsaved changes" if st.session_state.dirty else "✓ Saved"
+    st.markdown(
+        f'<div style="font-family:Sora;font-weight:700;font-size:1.05rem">🧳 My Trips</div>'
+        f'<div style="font-size:.75rem;color:{"#ffb457" if st.session_state.dirty else "#4ade80"};'
+        f'margin:.2rem 0 .6rem">{status}</div>',
+        unsafe_allow_html=True,
+    )
+
+    if st.button("💾 Save trip", type="primary", width="stretch"):
+        trip_id = db.save_trip(user["id"], trip["name"], serialize_state())
+        st.session_state.current_trip_id = trip_id
+        st.session_state.dirty = False
+        st.toast(f"Saved “{trip['name']}” to your account", icon="💾")
+        st.rerun()
+
+    if saved:
+        labels = {
+            f"{t['name']}  ·  {datetime.fromisoformat(t['updated_at']):%b %d, %H:%M}": t
+            for t in saved
+        }
+        chosen_label = st.selectbox("Saved trips", list(labels), label_visibility="collapsed")
+        chosen = labels[chosen_label]
+
+        col_load, col_del = st.columns(2)
+        if col_load.button("📂 Open", width="stretch"):
+            loaded = db.load_trip(user["id"], chosen["id"])
+            if loaded is None:
+                st.toast("That trip no longer exists.", icon="⚠️")
+            else:
+                apply_state(loaded["state"])
+                st.session_state.current_trip_id = loaded["id"]
+                st.toast(f"Opened “{loaded['name']}”", icon="📂")
+            st.rerun()
+        if col_del.button("🗑️ Delete", width="stretch"):
+            db.delete_trip(user["id"], chosen["id"])
+            if st.session_state.current_trip_id == chosen["id"]:
+                st.session_state.current_trip_id = None
+            st.toast(f"Deleted “{chosen['name']}”", icon="🗑️")
+            st.rerun()
+    else:
+        st.caption("No saved trips yet. Plan below, then hit Save trip.")
+
+    if st.button("🆕 Start a new trip", width="stretch"):
+        reset_workspace()
+        st.rerun()
+
+    st.divider()
+    st.markdown('<div style="font-family:Sora;font-weight:700">⚙️ Trip settings</div>',
+                unsafe_allow_html=True)
+
+    name = st.text_input("Trip name", value=trip["name"])
+    destination = st.text_input("Destination", value=trip["destination"])
+    start_date = st.date_input("Start date", value=trip["start_date"])
+    num_days = st.number_input("Number of days", min_value=1, max_value=60,
+                               value=int(trip["num_days"]))
+    currency = st.text_input("Currency symbol", value=trip["currency"], max_chars=3)
+    budget = st.number_input("Total budget", min_value=0.0, value=float(trip["budget"]),
+                             step=50.0)
+
+    updates = {"name": name, "destination": destination, "start_date": start_date,
+               "num_days": int(num_days), "currency": currency, "budget": float(budget)}
+    if any(trip[k] != v for k, v in updates.items()):
+        trip.update(updates)
+        mark_dirty()
+
+    # Items scheduled beyond a shortened trip would silently disappear.
+    stranded = [i for i in st.session_state.itinerary if i["Day"] >= int(num_days)]
+    if stranded:
+        st.warning(f"{len(stranded)} scheduled item(s) fall outside Day 1-{int(num_days)}.")
+        if st.button("↩️ Move them back to the bucket list", width="stretch"):
+            for item in list(stranded):
+                move_to_bucket_list(item["id"])
+            st.rerun()
+
+    st.divider()
+    st.markdown('<div style="font-family:Sora;font-weight:700">📤 Backup</div>',
+                unsafe_allow_html=True)
+    st.download_button("Export trip (JSON)",
+                       data=json.dumps(serialize_state(), indent=2, ensure_ascii=False),
+                       file_name=f"{trip['name'] or 'trip'}.json",
+                       mime="application/json", width="stretch")
+    uploaded = st.file_uploader("Import trip (JSON)", type="json")
+    if uploaded is not None and st.button("Load imported file", width="stretch"):
+        try:
+            apply_state(json.loads(uploaded.getvalue().decode("utf-8")))
+        except (json.JSONDecodeError, KeyError, ValueError) as exc:
+            st.error(f"That file could not be read: {exc}")
+        else:
+            st.session_state.current_trip_id = None
+            st.session_state.dirty = True
+            st.toast("Trip imported — remember to save it", icon="📥")
+            st.rerun()
+
+    if st.session_state.last_deleted:
         st.divider()
-        if st.button("↩️ Undo Last Delete"):
+        if st.button("↩️ Undo last delete", width="stretch"):
             restore_last_deleted()
             st.rerun()
 
 
+# ==================================================================
+# HERO
+# ==================================================================
+trip = st.session_state.trip
 days_until = (trip["start_date"] - date.today()).days
 if days_until > 0:
-    hero_badge = f"🗓️ {days_until} days to go"
+    countdown = f"🗓️ {days_until} days to go"
 elif days_until == 0:
-    hero_badge = "✈️ Departing today!"
+    countdown = "✈️ Departing today"
 else:
-    hero_badge = f"🏁 Trip started {-days_until} days ago"
+    countdown = f"🏁 Started {-days_until} days ago"
 
-st.markdown(
-    f"""
-    <div class="tp-hero">
-        <h1>✈️ {trip['name'] or 'Untitled Trip'}</h1>
-        <div class="tp-destination">📍 {trip['destination'] or 'Destination TBD'}</div>
-        <span class="tp-hero-badge">{hero_badge}</span>
-    </div>
-    """,
-    unsafe_allow_html=True,
+planned_spend = sum(i.get("Cost") or 0 for i in all_items())
+theme.hero(
+    trip["name"] or "Untitled Trip",
+    trip["destination"] or "Destination TBD",
+    [
+        (countdown, True),
+        (f"📅 {trip['num_days']} days", False),
+        (f"📍 {len(st.session_state.itinerary)} scheduled", False),
+        (f"💡 {len(st.session_state.bucket_list)} ideas", False),
+        (f"💰 {money(planned_spend)} planned", False),
+    ],
 )
 
-tab_plan, tab_itinerary, tab_budget, tab_packing, tab_stats = st.tabs(
-    ["📋 Plan", "🗺️ Itinerary", "💰 Budget", "🎒 Packing List", "📊 Stats"]
+tab_plan, tab_itinerary, tab_map, tab_budget, tab_packing, tab_stats = st.tabs(
+    ["✨ Plan", "🗓️ Itinerary", "🛰️ Map", "💰 Budget", "🎒 Packing", "📊 Insights"]
 )
 
-# ==============================
-# TAB: PLAN (Bucket List + Scheduling)
-# ==============================
+
+# ==================================================================
+# TAB: PLAN
+# ==================================================================
 with tab_plan:
-    col1, col2 = st.columns([1, 1])
+    left, right = st.columns([1, 1], gap="large")
 
-    with col1:
-        st.header("Bucket List")
-        st.caption("Add places you want to visit here without worrying about time yet.")
+    with left:
+        theme.section("Add a place", "Capture the idea now, schedule it later")
 
-        with st.form("add_place_form", clear_on_submit=True):
-            new_place = st.text_input("Location Name", placeholder="e.g., Osaka Castle")
-            new_category = st.selectbox("Category", CATEGORIES)
-            new_priority = st.selectbox("Priority", PRIORITIES)
-            c1, c2 = st.columns(2)
-            new_cost = c1.number_input("Est. Cost", min_value=0.0, step=1.0)
-            new_duration = c2.number_input("Duration (min)", min_value=0, step=15, value=60)
-            c3, c4 = st.columns(2)
-            new_lat = c3.number_input("Latitude (optional)", value=0.0, format="%.6f")
-            new_lon = c4.number_input("Longitude (optional)", value=0.0, format="%.6f")
-            new_notes = st.text_area("Notes", placeholder="e.g., Buy tickets in advance")
-            submitted = st.form_submit_button("Add to List")
+        with st.expander("📍 Look up coordinates (optional)"):
+            lookup = st.text_input("Search for a place", key="geo_query",
+                                   placeholder="e.g., Senso-ji Temple, Tokyo")
+            if st.button("Search", key="geo_search"):
+                if lookup.strip():
+                    try:
+                        st.session_state.geocode_results = geocode.search(lookup)
+                    except geocode.GeocodeUnavailable as exc:
+                        st.session_state.geocode_results = None
+                        st.warning(str(exc))
+            results = st.session_state.geocode_results
+            if results:
+                for index, hit in enumerate(results):
+                    row_text, row_button = st.columns([4, 1])
+                    row_text.caption(f"{hit['name']}  \n`{hit['lat']:.5f}, {hit['lon']:.5f}`")
+                    if row_button.button("Use", key=f"geo_use_{index}"):
+                        st.session_state.pending_coords = (hit["lat"], hit["lon"])
+                        st.session_state.geocode_results = None
+                        st.rerun()
+            elif results == []:
+                st.caption("No matches found.")
 
-            if submitted and new_place:
-                add_to_bucket_list(
-                    new_place, new_category, new_notes, new_priority, new_cost, new_duration,
-                    new_lat or None, new_lon or None,
-                )
-                st.success(f"Added {new_place}!")
+        pending = st.session_state.pending_coords
+        if pending:
+            st.success(f"Using coordinates {pending[0]:.5f}, {pending[1]:.5f}")
 
-        st.divider()
-        st.subheader("📍 Unscheduled Places")
+        with st.form("add_place", clear_on_submit=True):
+            place = st.text_input("Location name", placeholder="e.g., Senso-ji Temple")
+            col_a, col_b = st.columns(2)
+            category = col_a.selectbox("Category", CATEGORIES)
+            priority = col_b.selectbox("Priority", PRIORITIES)
+            col_c, col_d = st.columns(2)
+            cost = col_c.number_input("Est. cost", min_value=0.0, step=5.0)
+            duration = col_d.number_input("Duration (min)", min_value=0, step=15, value=60)
+            col_e, col_f = st.columns(2)
+            latitude = col_e.number_input("Latitude", value=float(pending[0]) if pending else 0.0,
+                                         format="%.6f")
+            longitude = col_f.number_input("Longitude", value=float(pending[1]) if pending else 0.0,
+                                          format="%.6f")
+            notes = st.text_area("Notes", placeholder="Tickets, opening hours, reminders…")
 
-        search_col, filter_col = st.columns(2)
-        search_term = search_col.text_input("Search", placeholder="Filter by name/notes")
-        category_filter = filter_col.multiselect("Filter by category", CATEGORIES)
+            if st.form_submit_button("Add to bucket list", type="primary", width="stretch"):
+                if not place.strip():
+                    st.warning("Give the place a name first.")
+                else:
+                    st.session_state.bucket_list.append({
+                        "id": new_id(), "Place": place.strip(), "Category": category,
+                        "Priority": priority, "Notes": notes.strip(), "Cost": float(cost),
+                        "Duration": int(duration),
+                        "Lat": float(latitude) or None, "Lon": float(longitude) or None,
+                    })
+                    st.session_state.pending_coords = None
+                    mark_dirty()
+                    st.toast(f"Added {place.strip()}", icon="✨")
+                    st.rerun()
 
-        visible = st.session_state.bucket_list
-        if search_term:
-            term = search_term.lower()
-            visible = [p for p in visible if term in p["Place"].lower() or term in (p.get("Notes") or "").lower()]
-        if category_filter:
-            visible = [p for p in visible if p["Category"] in category_filter]
+    with right:
+        theme.section("Bucket list",
+                      f"{len(st.session_state.bucket_list)} idea(s) waiting for a slot")
+
+        if st.session_state.bucket_list:
+            filter_search, filter_category = st.columns([1, 1])
+            query = filter_search.text_input("Search", placeholder="Filter by name or notes",
+                                             label_visibility="collapsed")
+            categories = filter_category.multiselect("Categories", CATEGORIES,
+                                                     placeholder="All categories",
+                                                     label_visibility="collapsed")
+            visible = st.session_state.bucket_list
+            if query:
+                needle = query.lower()
+                visible = [p for p in visible
+                           if needle in p["Place"].lower()
+                           or needle in (p.get("Notes") or "").lower()]
+            if categories:
+                visible = [p for p in visible if p["Category"] in categories]
+        else:
+            visible = []
 
         if not st.session_state.bucket_list:
-            st.write("Your bucket list is empty.")
+            theme.empty_state("💡", "Nothing here yet — add a place on the left to get started.")
         elif not visible:
-            st.write("No places match your filters.")
+            theme.empty_state("🔍", "No places match those filters.")
         else:
-            for place in visible:
-                with st.container(border=True):
-                    st.markdown(f"**{place['Category']} {place['Place']}**  ·  {place['Priority']}")
-                    meta_bits = []
-                    if place.get("Cost"):
-                        meta_bits.append(f"{trip['currency']}{place['Cost']:.2f}")
-                    if place.get("Duration"):
-                        meta_bits.append(f"{place['Duration']} min")
-                    if meta_bits:
-                        st.caption(" · ".join(meta_bits))
-                    if place.get("Notes"):
-                        st.caption(place["Notes"])
+            for place_item in visible:
+                accent = CATEGORY_COLORS.get(place_item["Category"], "#7c6cff")
+                meta = []
+                if place_item.get("Duration"):
+                    meta.append(f"{place_item['Duration']} min")
+                if has_coords(place_item):
+                    meta.append("📍 located")
+                theme.place_card(
+                    place_item, accent,
+                    time_text=" · ".join(meta),
+                    cost_text=money(place_item["Cost"]) if place_item.get("Cost") else "",
+                )
+                col_day, col_time, col_go, col_del = st.columns([1.9, 1.2, 1.2, 0.6])
+                chosen_day = col_day.selectbox("Day", day_options(), format_func=day_label,
+                                               key=f"day_{place_item['id']}",
+                                               label_visibility="collapsed")
+                chosen_time = col_time.time_input("Time", value=time(9, 0),
+                                                  key=f"time_{place_item['id']}",
+                                                  label_visibility="collapsed")
+                if col_go.button("Schedule", key=f"sched_{place_item['id']}",
+                                 width="stretch"):
+                    move_to_itinerary(place_item["id"], chosen_day, chosen_time)
+                    st.rerun()
+                if col_del.button("🗑️", key=f"delb_{place_item['id']}", width="stretch"):
+                    delete_item("bucket_list", place_item["id"])
+                    st.rerun()
 
-                    sc1, sc2, sc3 = st.columns([1, 1, 1])
-                    sched_day = sc1.selectbox(
-                        "Day", day_options(), format_func=day_label, key=f"day_{place['id']}"
-                    )
-                    sched_time = sc2.time_input("Time", value=time(9, 0), key=f"time_{place['id']}")
-                    sc3.write("")
-                    sc3.write("")
-                    b1, b2 = st.columns(2)
-                    if b1.button("Schedule ➡️", key=f"sched_{place['id']}"):
-                        move_to_itinerary(place["id"], sched_day, sched_time)
-                        st.rerun()
-                    if b2.button("🗑️ Delete", key=f"del_bucket_{place['id']}"):
-                        delete_item("bucket_list", place["id"])
-                        st.rerun()
 
-    with col2:
-        st.header("Quick Itinerary Preview")
-        if not st.session_state.itinerary:
-            st.write("No items scheduled yet. Schedule items from the left to see them here.")
-        else:
-            for day_index in day_options():
-                day_items = [i for i in st.session_state.itinerary if i["Day"] == day_index]
-                if not day_items:
-                    continue
-                st.markdown(f"**{day_label(day_index)}**")
-                for item in sorted(day_items, key=lambda x: x["Time"]):
-                    st.caption(f"{item['Time'].strftime('%I:%M %p')} — {item['Category']} {item['Place']}")
-                conflicts = find_conflicts(day_index)
-                for a, b in conflicts:
-                    st.warning(f"⚠️ Time conflict on {day_label(day_index)}: **{a}** overlaps **{b}**")
-
-# ==============================
-# TAB: ITINERARY (Full schedule with editing)
-# ==============================
+# ==================================================================
+# TAB: ITINERARY
+# ==================================================================
 with tab_itinerary:
-    st.header("Your Full Itinerary")
-
     if not st.session_state.itinerary:
-        st.write("No items scheduled yet. Use the Plan tab to schedule places.")
+        theme.empty_state("🗓️", "Nothing scheduled yet. Add places in Plan, then schedule them.")
     else:
-        for day_index in day_options():
-            day_items = [i for i in st.session_state.itinerary if i["Day"] == day_index]
-            if not day_items:
+        total_conflicts = sum(len(find_conflicts(d)) for d in day_options())
+        cols = st.columns(4)
+        with cols[0]:
+            theme.stat("Scheduled", len(st.session_state.itinerary), "activities")
+        with cols[1]:
+            total = sum(day_minutes(d) for d in day_options())
+            theme.stat("Planned time", f"{total // 60}h {total % 60}m", "across the trip")
+        with cols[2]:
+            theme.stat("Days in use",
+                       sum(1 for d in day_options() if day_minutes(d) > 0),
+                       f"of {trip['num_days']}")
+        with cols[3]:
+            theme.stat("Clashes", total_conflicts,
+                       "overlapping" if total_conflicts else "all clear")
+
+        st.write("")
+        for index in day_options():
+            items = sorted([i for i in st.session_state.itinerary if i["Day"] == index],
+                           key=lambda x: x["Time"])
+            minutes = day_minutes(index)
+            spend = sum(i.get("Cost") or 0 for i in items)
+            meta = (f"{len(items)} stops · {minutes // 60}h {minutes % 60}m"
+                    f"{' · ' + money(spend) if spend else ''}") if items else "Nothing planned"
+            theme.day_header(index, day_label(index), meta)
+
+            if not items:
+                st.caption("— free day —")
                 continue
 
-            with st.expander(f"🗓️ {day_label(day_index)}", expanded=True):
-                conflicts = find_conflicts(day_index)
-                for a, b in conflicts:
-                    st.warning(f"⚠️ Time conflict: **{a}** overlaps **{b}**")
+            # A pile-up of items at one time produces every pairwise combination,
+            # so show a couple of examples and summarise the rest.
+            clashes = find_conflicts(index)
+            for first, second in clashes[:2]:
+                st.warning(f"⚠️ **{first}** overlaps **{second}**")
+            if len(clashes) > 2:
+                st.warning(f"⚠️ …and {len(clashes) - 2} more overlapping pair(s) on this day.")
 
-                for item in sorted(day_items, key=lambda x: x["Time"]):
-                    color = CATEGORY_COLORS.get(item["Category"], "#ff4b4b")
-                    time_str = item["Time"].strftime("%I:%M %p")
-                    cost_str = f" · {trip['currency']}{item['Cost']:.2f}" if item.get("Cost") else ""
-                    st.markdown(
-                        f"""
-                        <div class="tp-item-card" style="--card-color: {color};">
-                            <strong>{time_str}</strong> | {item['Category']} | {item['Priority']}{cost_str}
-                            <h4 style="margin:0; padding-top:5px;">{item['Place']}</h4>
-                            <em style="color: #555;">{item.get('Notes') or ''}</em>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-                    ec1, ec2, ec3 = st.columns([1, 1, 1])
-                    new_day = ec1.selectbox(
-                        "Move to day", day_options(), index=item["Day"], format_func=day_label,
-                        key=f"edit_day_{item['id']}",
-                    )
-                    new_time = ec2.time_input("New time", value=item["Time"], key=f"edit_time_{item['id']}")
-                    if ec3.button("Update", key=f"update_{item['id']}"):
+            for item in items:
+                theme.place_card(
+                    item,
+                    day_color(index),
+                    time_text=item["Time"].strftime("%I:%M %p"),
+                    cost_text=money(item["Cost"]) if item.get("Cost") else "",
+                )
+                col_day, col_time, col_update, col_back, col_remove = st.columns(
+                    [2, 1.4, 1, 1.2, 0.8]
+                )
+                new_day = col_day.selectbox("Day", day_options(), index=item["Day"],
+                                            format_func=day_label,
+                                            key=f"eday_{item['id']}",
+                                            label_visibility="collapsed")
+                new_time = col_time.time_input("Time", value=item["Time"],
+                                               key=f"etime_{item['id']}",
+                                               label_visibility="collapsed")
+                if col_update.button("Update", key=f"upd_{item['id']}", width="stretch"):
+                    if (item["Day"], item["Time"]) != (new_day, new_time):
                         item["Day"] = new_day
                         item["Time"] = new_time
                         st.session_state.itinerary.sort(key=lambda x: (x["Day"], x["Time"]))
-                        st.rerun()
-                    bc1, bc2 = st.columns(2)
-                    if bc1.button("↩️ Unschedule", key=f"unsched_{item['id']}"):
-                        move_to_bucket_list(item["id"])
-                        st.rerun()
-                    if bc2.button("🗑️ Remove", key=f"del_itin_{item['id']}"):
-                        delete_item("itinerary", item["id"])
-                        st.rerun()
+                        mark_dirty()
+                    st.rerun()
+                if col_back.button("Unschedule", key=f"uns_{item['id']}", width="stretch"):
+                    move_to_bucket_list(item["id"])
+                    st.rerun()
+                if col_remove.button("🗑️", key=f"deli_{item['id']}", width="stretch"):
+                    delete_item("itinerary", item["id"])
+                    st.rerun()
 
         st.divider()
-        st.subheader("📤 Export")
-        df = pd.DataFrame(
-            [
-                {
-                    "Day": day_label(i["Day"]),
-                    "Time": i["Time"].strftime("%H:%M"),
-                    "Category": i["Category"],
-                    "Place": i["Place"],
-                    "Priority": i["Priority"],
-                    "Cost": i.get("Cost") or 0,
-                    "Notes": i.get("Notes") or "",
-                }
-                for i in st.session_state.itinerary
-            ]
+        theme.section("Export", "Take the plan with you")
+        frame = itinerary_dataframe()
+        col1, col2, col3 = st.columns(3)
+        col1.download_button("📥 CSV", data=frame.to_csv(index=False).encode("utf-8"),
+                             file_name="itinerary.csv", mime="text/csv", width="stretch")
+        col2.download_button("📅 Calendar (.ics)", data=export_ics(),
+                             file_name="itinerary.ics", mime="text/calendar",
+                             width="stretch")
+        col3.download_button("📝 Markdown", data=export_markdown(),
+                             file_name="itinerary.md", mime="text/markdown",
+                             width="stretch")
+
+
+# ==================================================================
+# TAB: MAP
+# ==================================================================
+with tab_map:
+    theme.section("Satellite view", "Every located stop, coloured by day")
+
+    scheduled_located = [i for i in st.session_state.itinerary if has_coords(i)]
+    bucket_located = [i for i in st.session_state.bucket_list if has_coords(i)]
+    missing = [i for i in all_items() if not has_coords(i)]
+
+    controls_left, controls_right = st.columns([2, 1.4])
+    basemap = controls_left.radio("Basemap", list(mapview.BASEMAPS),
+                                  index=list(mapview.BASEMAPS).index(mapview.DEFAULT_BASEMAP),
+                                  horizontal=True)
+    show_labels = controls_right.checkbox("Show name labels", value=True)
+    show_routes = controls_right.checkbox("Draw day routes", value=True)
+    compact_labels = controls_right.checkbox(
+        "Compact labels", value=False,
+        help="Show just day/stop numbers — useful when stops sit close together.",
+    )
+
+    day_filter = st.multiselect("Days to show", day_options(), format_func=day_label,
+                                placeholder="All days")
+    active_days = day_filter or day_options()
+
+    points, routes = [], []
+    for index in active_days:
+        day_items = sorted([i for i in scheduled_located if i["Day"] == index],
+                           key=lambda x: x["Time"])
+        for order, item in enumerate(day_items, start=1):
+            stop_ref = f"D{index + 1}.{order}"
+            points.append({
+                "lat": float(item["Lat"]), "lon": float(item["Lon"]),
+                "name": item["Place"],
+                # Map labels use deck.gl's ASCII font atlas, so no emoji here.
+                "label": stop_ref if compact_labels else f"{stop_ref}  {item['Place']}",
+                "meta": (f"{day_label(index)} · {item['Time']:%I:%M %p} · "
+                         f"{item['Category']}"),
+                "color": day_color(index),
+            })
+        if len(day_items) > 1:
+            routes.append({
+                "path": [[float(i["Lon"]), float(i["Lat"])] for i in day_items],
+                "color": day_color(index),
+                "name": day_label(index),
+            })
+
+    if not day_filter:
+        for item in bucket_located:
+            points.append({
+                "lat": float(item["Lat"]), "lon": float(item["Lon"]),
+                "name": item["Place"],
+                "label": "" if compact_labels else item["Place"],
+                "meta": f"Unscheduled · {item['Category']}",
+                "color": "#94a3c8",
+            })
+
+    if points:
+        legend_entries = [(day_label(d), day_color(d)) for d in active_days
+                          if any(i["Day"] == d for i in scheduled_located)]
+        if bucket_located and not day_filter:
+            legend_entries.append(("Unscheduled ideas", "#94a3c8"))
+        if legend_entries:
+            theme.legend(legend_entries)
+
+        st.pydeck_chart(
+            mapview.build_deck(points, routes=routes, basemap=basemap,
+                               show_labels=show_labels, show_routes=show_routes),
+            height=620,
         )
-        e1, e2, e3 = st.columns(3)
-        e1.download_button(
-            "📥 Download CSV", data=df.to_csv(index=False).encode("utf-8"),
-            file_name="itinerary.csv", mime="text/csv",
-        )
-        e2.download_button(
-            "📅 Download Calendar (.ics)", data=export_ics(),
-            file_name="itinerary.ics", mime="text/calendar",
-        )
-        e3.download_button(
-            "📝 Download Markdown", data=export_markdown(),
-            file_name="itinerary.md", mime="text/markdown",
+        st.caption(f"{len(points)} location(s) shown · {mapview.attribution(basemap)}")
+        st.caption("Tiles are fetched by your browser — if the imagery stays blank, "
+                   "the network is blocking the tile server.")
+    else:
+        theme.empty_state(
+            "🛰️",
+            "No coordinates yet. Add latitude/longitude to a place — the "
+            "“Look up coordinates” tool in Plan can find them for you.",
         )
 
-        mappable = [i for i in st.session_state.itinerary if i.get("Lat") and i.get("Lon")]
-        if mappable:
-            st.divider()
-            st.subheader("🗺️ Map")
-            map_df = pd.DataFrame({"lat": [i["Lat"] for i in mappable], "lon": [i["Lon"] for i in mappable]})
-            st.map(map_df)
+    if missing:
+        st.divider()
+        theme.section("Missing coordinates", f"{len(missing)} place(s) not on the map")
+        for item in missing:
+            col_name, col_action = st.columns([3, 1])
+            col_name.markdown(f"{item['Category']} **{theme.esc(item['Place'])}**")
+            if col_action.button("📍 Locate", key=f"loc_{item['id']}", width="stretch"):
+                try:
+                    hits = geocode.search(f"{item['Place']} {trip['destination']}", limit=1)
+                except geocode.GeocodeUnavailable as exc:
+                    st.warning(str(exc))
+                else:
+                    if hits:
+                        item["Lat"] = hits[0]["lat"]
+                        item["Lon"] = hits[0]["lon"]
+                        mark_dirty()
+                        st.toast(f"Located {item['Place']}", icon="📍")
+                        st.rerun()
+                    else:
+                        st.warning(f"No match found for “{item['Place']}”.")
 
-# ==============================
+
+# ==================================================================
 # TAB: BUDGET
-# ==============================
+# ==================================================================
 with tab_budget:
-    st.header("💰 Budget Tracker")
+    theme.section("Budget", "Estimated costs across everything you've added")
 
-    all_items = st.session_state.bucket_list + st.session_state.itinerary
-    total_spent = sum(item.get("Cost") or 0 for item in all_items)
-    budget = trip["budget"]
+    spend = sum(i.get("Cost") or 0 for i in all_items())
+    budget_total = trip["budget"]
+    remaining = budget_total - spend
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Total Budget", f"{trip['currency']}{budget:,.2f}")
-    m2.metric("Planned Spend", f"{trip['currency']}{total_spent:,.2f}")
-    remaining = budget - total_spent
-    m3.metric("Remaining", f"{trip['currency']}{remaining:,.2f}", delta=None)
+    cols = st.columns(4)
+    with cols[0]:
+        theme.stat("Budget", money(budget_total), "total set")
+    with cols[1]:
+        theme.stat("Planned", money(spend), f"{len([i for i in all_items() if i.get('Cost')])} costed items")
+    with cols[2]:
+        theme.stat("Remaining", money(remaining),
+                   "over budget" if remaining < 0 else "still available")
+    with cols[3]:
+        per_day = spend / max(trip["num_days"], 1)
+        theme.stat("Per day", money(per_day), "average")
 
-    if budget > 0:
-        pct = min(total_spent / budget, 1.0)
-        st.progress(pct, text=f"{pct * 100:.0f}% of budget planned")
-        if total_spent > budget:
-            st.error("⚠️ You are over budget!")
+    st.write("")
+    if budget_total > 0:
+        ratio = min(spend / budget_total, 1.0)
+        st.progress(ratio, text=f"{ratio * 100:.0f}% of budget allocated")
+        if spend > budget_total:
+            st.error(f"⚠️ Over budget by {money(spend - budget_total)}.")
+    else:
+        st.caption("Set a total budget in the sidebar to track progress against it.")
 
-    if all_items:
+    if any(i.get("Cost") for i in all_items()):
         st.divider()
-        st.subheader("Spend by Category")
-        cat_totals = {}
-        for item in all_items:
-            cat_totals[item["Category"]] = cat_totals.get(item["Category"], 0) + (item.get("Cost") or 0)
-        chart_df = pd.DataFrame({"Category": list(cat_totals.keys()), "Cost": list(cat_totals.values())})
-        chart_df = chart_df.set_index("Category")
-        st.bar_chart(chart_df)
+        chart_left, chart_right = st.columns([1, 1], gap="large")
 
-        st.subheader("All Costed Items")
-        cost_df = pd.DataFrame(
-            [
-                {"Place": i["Place"], "Category": i["Category"], "Cost": i.get("Cost") or 0}
-                for i in all_items if i.get("Cost")
-            ]
+        with chart_left:
+            theme.section("By category")
+            totals = {}
+            for item in all_items():
+                if item.get("Cost"):
+                    totals[item["Category"]] = totals.get(item["Category"], 0) + item["Cost"]
+            st.bar_chart(pd.DataFrame({"Cost": totals}), color="#7c6cff", height=280)
+
+        with chart_right:
+            theme.section("By day")
+            per_day_totals = {
+                day_label(d): sum(i.get("Cost") or 0 for i in st.session_state.itinerary
+                                  if i["Day"] == d)
+                for d in day_options()
+            }
+            st.bar_chart(pd.DataFrame({"Cost": per_day_totals}), color="#38dbff", height=280)
+
+        theme.section("All costed items")
+        st.dataframe(
+            pd.DataFrame([
+                {"Place": i["Place"], "Category": i["Category"],
+                 "When": day_label(i["Day"]) if "Day" in i else "Unscheduled",
+                 "Cost": i["Cost"]}
+                for i in all_items() if i.get("Cost")
+            ]).sort_values("Cost", ascending=False),
+            hide_index=True, width="stretch",
         )
-        if not cost_df.empty:
-            st.dataframe(cost_df, hide_index=True, width='stretch')
     else:
-        st.write("Add places with costs to see your budget breakdown.")
+        theme.empty_state("💰", "Add costs to your places to see the breakdown.")
 
-# ==============================
-# TAB: PACKING LIST
-# ==============================
+
+# ==================================================================
+# TAB: PACKING
+# ==================================================================
 with tab_packing:
-    st.header("🎒 Packing List")
+    theme.section("Packing list", "Tick things off as they go in the bag")
 
-    with st.form("add_pack_form", clear_on_submit=True):
-        pc1, pc2 = st.columns([3, 1])
-        pack_item = pc1.text_input("Item", placeholder="e.g., Passport")
-        pack_qty = pc2.number_input("Qty", min_value=1, value=1)
-        if st.form_submit_button("Add Item") and pack_item:
-            st.session_state.packing_list.append(
-                {"id": new_id(), "Item": pack_item, "Qty": pack_qty, "Packed": False}
-            )
-
-    if not st.session_state.packing_list:
-        st.write("Your packing list is empty.")
-    else:
-        packed_count = sum(1 for i in st.session_state.packing_list if i["Packed"])
-        st.progress(
-            packed_count / len(st.session_state.packing_list),
-            text=f"{packed_count}/{len(st.session_state.packing_list)} packed",
-        )
-        for pack in st.session_state.packing_list:
-            pcol1, pcol2, pcol3 = st.columns([3, 1, 1])
-            pack["Packed"] = pcol1.checkbox(
-                f"{pack['Item']} (x{pack['Qty']})", value=pack["Packed"], key=f"pack_{pack['id']}"
-            )
-            if pcol3.button("🗑️", key=f"del_pack_{pack['id']}"):
-                delete_item("packing_list", pack["id"])
+    with st.form("add_pack", clear_on_submit=True):
+        col_item, col_qty, col_add = st.columns([3, 1, 1])
+        pack_name = col_item.text_input("Item", placeholder="e.g., Passport",
+                                        label_visibility="collapsed")
+        pack_qty = col_qty.number_input("Qty", min_value=1, value=1,
+                                        label_visibility="collapsed")
+        col_add.write("")
+        if col_add.form_submit_button("Add", type="primary", width="stretch"):
+            if pack_name.strip():
+                st.session_state.packing_list.append({
+                    "id": new_id(), "Item": pack_name.strip(),
+                    "Qty": int(pack_qty), "Packed": False,
+                })
+                mark_dirty()
                 st.rerun()
 
-# ==============================
-# TAB: STATS
-# ==============================
-with tab_stats:
-    st.header("📊 Trip Stats")
-
-    all_items = st.session_state.bucket_list + st.session_state.itinerary
-    s1, s2, s3, s4 = st.columns(4)
-    s1.metric("Total Places", len(all_items))
-    s2.metric("Scheduled", len(st.session_state.itinerary))
-    s3.metric("Unscheduled", len(st.session_state.bucket_list))
-    total_minutes = sum(i.get("Duration") or 0 for i in st.session_state.itinerary)
-    s4.metric("Planned Time", f"{total_minutes // 60}h {total_minutes % 60}m")
-
-    if all_items:
-        st.divider()
-        st.subheader("Places by Category")
-        cat_counts = {}
-        for item in all_items:
-            cat_counts[item["Category"]] = cat_counts.get(item["Category"], 0) + 1
-        cat_df = pd.DataFrame({"Category": list(cat_counts.keys()), "Count": list(cat_counts.values())})
-        st.bar_chart(cat_df.set_index("Category"))
-
-        st.subheader("Places by Priority")
-        pri_counts = {}
-        for item in all_items:
-            pri_counts[item["Priority"]] = pri_counts.get(item["Priority"], 0) + 1
-        pri_df = pd.DataFrame({"Priority": list(pri_counts.keys()), "Count": list(pri_counts.values())})
-        st.bar_chart(pri_df.set_index("Priority"))
-
-        st.subheader("Fill Rate by Day")
-        fill_data = []
-        for day_index in day_options():
-            day_minutes = sum(
-                (i.get("Duration") or 0) for i in st.session_state.itinerary if i["Day"] == day_index
-            )
-            fill_data.append({"Day": day_label(day_index), "Hours Planned": round(day_minutes / 60, 1)})
-        st.bar_chart(pd.DataFrame(fill_data).set_index("Day"))
+    packing = st.session_state.packing_list
+    if not packing:
+        theme.empty_state("🎒", "Your packing list is empty.")
     else:
-        st.write("Add some places to see trip statistics.")
+        packed = sum(1 for i in packing if i["Packed"])
+        st.progress(packed / len(packing), text=f"{packed} of {len(packing)} packed")
+        st.write("")
+        for entry in packing:
+            col_check, col_del = st.columns([6, 1])
+            checked = col_check.checkbox(f"**{entry['Item']}**  ×{entry['Qty']}",
+                                         value=entry["Packed"], key=f"pack_{entry['id']}")
+            if checked != entry["Packed"]:
+                entry["Packed"] = checked
+                mark_dirty()
+            if col_del.button("🗑️", key=f"delp_{entry['id']}", width="stretch"):
+                delete_item("packing_list", entry["id"])
+                st.rerun()
+
+
+# ==================================================================
+# TAB: INSIGHTS
+# ==================================================================
+with tab_stats:
+    theme.section("Insights", "How the plan is shaping up")
+
+    items = all_items()
+    total_minutes = sum(day_minutes(d) for d in day_options())
+    cols = st.columns(4)
+    with cols[0]:
+        theme.stat("Places", len(items), "total ideas")
+    with cols[1]:
+        theme.stat("Scheduled", len(st.session_state.itinerary),
+                   f"{len(st.session_state.bucket_list)} still loose")
+    with cols[2]:
+        theme.stat("Planned time", f"{total_minutes // 60}h {total_minutes % 60}m",
+                   f"~{total_minutes / max(trip['num_days'], 1) / 60:.1f}h per day")
+    with cols[3]:
+        located = sum(1 for i in items if has_coords(i))
+        theme.stat("On the map", f"{located}/{len(items)}" if items else "0",
+                   "have coordinates")
+
+    if not items:
+        st.write("")
+        theme.empty_state("📊", "Add some places to unlock trip insights.")
+    else:
+        st.divider()
+        left_chart, right_chart = st.columns([1, 1], gap="large")
+
+        with left_chart:
+            theme.section("By category")
+            counts = {}
+            for item in items:
+                counts[item["Category"]] = counts.get(item["Category"], 0) + 1
+            st.bar_chart(pd.DataFrame({"Places": counts}), color="#7c6cff", height=280)
+
+        with right_chart:
+            theme.section("By priority")
+            counts = {}
+            for item in items:
+                counts[item["Priority"]] = counts.get(item["Priority"], 0) + 1
+            st.bar_chart(pd.DataFrame({"Places": counts}), color="#ff6b8b", height=280)
+
+        theme.section("Hours planned per day", "Spot the days that are too full or too empty")
+        st.bar_chart(
+            pd.DataFrame({"Hours": {day_label(d): round(day_minutes(d) / 60, 1)
+                                    for d in day_options()}}),
+            color="#38dbff", height=300,
+        )
